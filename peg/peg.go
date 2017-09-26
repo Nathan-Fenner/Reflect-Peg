@@ -30,9 +30,10 @@ type Literal struct {
 }
 
 // ByteParse is used by the peg package to directly extract from the input.
-func (literal *Literal) ByteParse(source []byte, here Location, tag []byte) (int, error) {
+func (literal *Literal) ByteParse(source []byte, here Location, tagFull reflect.StructTag) (int, error) {
+	tag := []byte(tagFull.Get("parse"))
 	if len(tag) == 0 {
-		panic(fmt.Sprintf("peg.Literal not given tag"))
+		panic(fmt.Sprintf("peg.Literal not given tag with 'parse'"))
 	}
 	if len(source) < len(tag) {
 		// TODO: handle whitespace
@@ -52,7 +53,7 @@ func (literal *Literal) ByteParse(source []byte, here Location, tag []byte) (int
 // A ByteParser reads source directly for parsing.
 // They receive the tag used to describe them in their parent struct as a third parameter.
 type ByteParser interface {
-	ByteParse(source []byte, here Location, tag []byte) (int, error)
+	ByteParse(source []byte, here Location, tag reflect.StructTag) (int, error)
 }
 
 // SomeType is used as a placeholder for any type.
@@ -80,7 +81,10 @@ type Context struct {
 // ParseInto takes a pointer to a value and parses the source provided into it,
 // using the shape of the type.
 func ParseInto(target interface{}, source []byte, context Context) error {
-	newContext := internalContext{Alternates: map[reflect.Type][]reflect.Type{}}
+	newContext := internalContext{
+		Alternates: map[reflect.Type][]reflect.Type{},
+		Parsed:     map[parseTarget]parseResult{},
+	}
 	for kind, options := range context.Alternates {
 		if reflect.TypeOf(kind).Kind() != reflect.Ptr {
 			panic(fmt.Sprintf("unexpected non-pointer key in peg.Context struct Alternates field of type %+v", reflect.TypeOf(kind)))
@@ -101,21 +105,60 @@ func ParseInto(target interface{}, source []byte, context Context) error {
 		}
 		newContext.Alternates[interfaceType] = newOptions
 	}
-	_, err := parseIntoField(reflect.ValueOf(target), source, Location{}, nil, newContext)
+	_, err := parseIntoField(reflect.ValueOf(target), source, Location{}, reflect.StructTag(""), newContext)
 	return err
+}
+
+type parseTarget struct {
+	index  int
+	target reflect.Type
+	tag    reflect.StructTag
+}
+
+type parseResult struct {
+	progress bool
+	rest     []byte
+	value    reflect.Value // pointer
+	err      error
 }
 
 type internalContext struct {
 	Alternates map[reflect.Type][]reflect.Type
+	Parsed     map[parseTarget]parseResult
 }
 
 // parseIntoField expects a pointer to a value of parseable type.
 // If parsing succeeds, then the returned error will be nil and the target will be assigned to the
 // parsed value.
-func parseIntoField(target reflect.Value, source []byte, here Location, tag []byte, context internalContext) ([]byte, error) {
+func parseIntoField(target reflect.Value, source []byte, here Location, tag reflect.StructTag, context internalContext) (resultRest []byte, resultErr error) {
 	if target.Type().Kind() != reflect.Ptr {
 		panic(fmt.Sprintf("ParseInto is called with non-pointer %+v", target))
 	}
+	// Check whether this type has already been parsed at this location.
+	memoizationKey := parseTarget{
+		index:  len(source),
+		target: target.Type().Elem(),
+		tag:    tag,
+	}
+	if found, ok := context.Parsed[memoizationKey]; ok {
+		if found.progress {
+			panic(fmt.Sprintf("ParseInto is left-recursive for type %+v at index %d", target.Type(), len(source)))
+		}
+		target.Elem().Set(found.value.Elem())
+		return found.rest, found.err
+	}
+	// Mark that the parse is in progress, to detect left-recursion.
+	context.Parsed[memoizationKey] = parseResult{progress: true}
+	defer func() {
+		// When the function completes and a value has been assigned, record this.
+		// This acts as an optimization to improve speed considerably.
+		context.Parsed[memoizationKey] = parseResult{
+			progress: false,
+			rest:     resultRest,
+			value:    target,
+			err:      resultErr,
+		}
+	}()
 	if byteParser, ok := target.Interface().(ByteParser); ok {
 		n, err := byteParser.ByteParse(source, here, tag)
 		if err != nil {
@@ -129,7 +172,7 @@ func parseIntoField(target reflect.Value, source []byte, here Location, tag []by
 			if method.Func.Type().NumIn() == 4 && method.Func.Type().In(2) == reflect.TypeOf(Location{}) && method.Func.Type().In(3) == reflect.TypeOf([]byte{}) && method.Func.Type().NumOut() == 1 && method.Func.Type().Out(0) == reflect.TypeOf((*error)(nil)).Elem() {
 				// Construct an object of the 'from' type, and parse into it.
 				fromPointer := reflect.New(method.Func.Type().In(1))
-				rest, err := parseIntoField(fromPointer, source, here, nil, context)
+				rest, err := parseIntoField(fromPointer, source, here, reflect.StructTag(""), context)
 				if err != nil {
 					return nil, err
 				}
@@ -181,12 +224,8 @@ func parseIntoField(target reflect.Value, source []byte, here Location, tag []by
 	if target.Type().Elem().Kind() == reflect.Struct {
 		result := reflect.New(target.Type().Elem())
 		for i := 0; i < target.Type().Elem().NumField(); i++ {
-			tag := target.Type().Elem().Field(i).Tag.Get("parse")
-			tagBytes := []byte(nil)
-			if tag != "" {
-				tagBytes = []byte(tag)
-			}
-			rest, err := parseIntoField(result.Elem().Field(i).Addr(), source, here, tagBytes, context)
+			tag := target.Type().Elem().Field(i).Tag
+			rest, err := parseIntoField(result.Elem().Field(i).Addr(), source, here, tag, context)
 			if err != nil {
 				return nil, err
 			}
