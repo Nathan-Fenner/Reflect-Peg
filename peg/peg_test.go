@@ -54,3 +54,31 @@ func TestReject(t *testing.T) {
 		t.Errorf("error expected")
 	}
 }
+
+func TestAlternation(t *testing.T) {
+	type EitherAB interface {
+	}
+
+	type A struct {
+		A Literal `parse:"A"`
+	}
+	type B struct {
+		B Literal `parse:"B"`
+	}
+
+	type Example struct {
+		Sequence []EitherAB
+	}
+
+	var example Example
+
+	err := ParseInto(&example, []byte("ABBBABAB"), Context{
+		Alternates: AlternateMap{
+			new(EitherAB): {new(A), new(B)},
+		},
+	})
+
+	if err != nil {
+		t.Errorf("error ``%s'' unexpected", err.Error())
+	}
+}
